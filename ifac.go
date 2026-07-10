@@ -2,19 +2,20 @@
 // macOS, and Windows, and multiplexes IP frames from all managed interfaces
 // into a single read path.
 //
-// Create brings up a TUN device, assigns it the first free host address in
+// Up brings up a TUN device, assigns it the first free host address in
 // the given subnet, and starts pumping inbound frames into a shared queue.
 // ReadFrom drains that queue; WriteTo injects a frame into the interface
 // identified by its IP (or, failing an exact match, the interface whose
 // subnet contains the IP).
 //
-// All functions are safe for concurrent use. The hot path (ReadFrom/WriteTo)
-// takes no locks: interface lookup goes through an atomically swapped
-// copy-on-write registry, and frame buffers are pooled to stay
-// allocation-free in steady state.
+// All functions are safe for concurrent use. Interface lookup goes through an
+// atomically swapped copy-on-write registry. Writes take a per-interface
+// shared lifecycle guard so teardown cannot close a device during an in-flight
+// write. Frame buffers are pooled to stay allocation-free in steady state.
 package ifac
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -24,13 +25,13 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/songgao/water"
+	"github.com/Doridian/water"
 )
 
 const (
-	// maxFrameSize is the largest frame a single ReadFrom can deliver.
-	// 64 KiB covers the maximum IP packet size regardless of MTU.
-	maxFrameSize = 65536
+	// MaxFrameSize is the largest packet a single ReadFrom can deliver.
+	// IP packets and Wintun are both limited to 65,535 bytes.
+	MaxFrameSize = 65535
 
 	// inboxSize bounds the number of frames buffered between the
 	// per-interface readers and ReadFrom callers. Readers block (never
@@ -39,19 +40,26 @@ const (
 	inboxSize = 1024
 )
 
+// ErrClosed is returned when an operation loses a race with interface
+// teardown after it has already selected that interface.
+var ErrClosed = errors.New("ifac: interface is closed")
+
 type frame struct {
-	ip  string
-	buf *[]byte
-	n   int
+	source *iface
+	buf    *[]byte
+	n      int
+	err    error
 }
 
 type iface struct {
-	name   string // logical name given to Create
+	name   string // logical name given to Up
 	dev    string // actual OS device name (may differ on macOS)
 	ip     string
 	prefix netip.Prefix
 	tun    *water.Interface
 	done   chan struct{}
+	ioMu   sync.RWMutex
+	closed bool
 }
 
 // registry is immutable after construction; mutations build a new copy and
@@ -59,12 +67,14 @@ type iface struct {
 type registry struct {
 	byName map[string]*iface
 	byIP   map[string]*iface
+	routes []*iface
 }
 
 func (r *registry) clone() *registry {
 	next := &registry{
 		byName: make(map[string]*iface, len(r.byName)+1),
 		byIP:   make(map[string]*iface, len(r.byIP)+1),
+		routes: append([]*iface(nil), r.routes...),
 	}
 	maps.Copy(next.byName, r.byName)
 	maps.Copy(next.byIP, r.byIP)
@@ -72,11 +82,11 @@ func (r *registry) clone() *registry {
 }
 
 var (
-	mu    sync.Mutex // serializes Create/Destroy (registry mutations)
+	mu    sync.Mutex // serializes Up/Down (registry mutations)
 	reg   atomic.Pointer[registry]
 	inbox = make(chan frame, inboxSize)
 	pool  = sync.Pool{New: func() any {
-		b := make([]byte, maxFrameSize)
+		b := make([]byte, MaxFrameSize)
 		return &b
 	}}
 )
@@ -85,7 +95,7 @@ func init() {
 	reg.Store(&registry{byName: map[string]*iface{}, byIP: map[string]*iface{}})
 }
 
-// Create brings up a TUN interface under the given logical name and returns
+// Up brings up a TUN interface under the given logical name and returns
 // its address. If ip is empty, the first free IPv4 host address in subnet
 // (CIDR notation, e.g. "10.42.0.0/24") is assigned automatically; otherwise
 // ip is used as given, provided it is a usable host address inside subnet
@@ -93,11 +103,11 @@ func init() {
 // interface become available through ReadFrom.
 //
 // Creating interfaces requires elevated privileges (root on Linux/macOS,
-// Administrator plus an installed TAP-Windows "tap0901" adapter on Windows).
+// Administrator on Windows).
 // On macOS the kernel only permits utunN device names; any other name is
-// kept as the logical handle for Destroy/List while the kernel picks the
+// kept as the logical handle for Down/List while the kernel picks the
 // actual device.
-func Create(name string, subnet string, ip string) (string, error) {
+func Up(name string, subnet string, ip string) (string, error) {
 	if name == "" {
 		return "", errors.New("ifac: name must not be empty")
 	}
@@ -105,6 +115,10 @@ func Create(name string, subnet string, ip string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("ifac: invalid subnet %q: %w", subnet, err)
 	}
+	if err := validatePrefix(prefix); err != nil {
+		return "", err
+	}
+	prefix = prefix.Masked()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -135,8 +149,11 @@ func Create(name string, subnet string, ip string) (string, error) {
 		return "", fmt.Errorf("ifac: create %q: %w", name, err)
 	}
 	if err := configure(dev, ip, prefix); err != nil {
-		tun.Close()
-		return "", fmt.Errorf("ifac: configure %q (%s): %w", name, dev, err)
+		cleanupErr := errors.Join(teardown(dev, ip, prefix), tun.Close())
+		return "", errors.Join(
+			fmt.Errorf("ifac: configure %q (%s): %w", name, dev, err),
+			wrapCleanupError(name, cleanupErr),
+		)
 	}
 
 	it := &iface{
@@ -151,15 +168,17 @@ func Create(name string, subnet string, ip string) (string, error) {
 	next := cur.clone()
 	next.byName[name] = it
 	next.byIP[ip] = it
+	next.routes = append(next.routes, it)
+	sortRoutes(next.routes)
 	reg.Store(next)
 
 	go it.readLoop()
 	return ip, nil
 }
 
-// Destroy tears down the interface previously created under name. Frames
-// from it that are already queued may still be returned by ReadFrom.
-func Destroy(name string) error {
+// Down tears down the interface previously brought up under name. Packets
+// queued by that interface are discarded.
+func Down(name string) error {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -172,12 +191,11 @@ func Destroy(name string) error {
 	next := cur.clone()
 	delete(next.byName, name)
 	delete(next.byIP, it.ip)
+	next.routes = removeRoute(next.routes, it)
 	reg.Store(next)
 
 	close(it.done)
-	err := it.tun.Close()
-	teardown(it.dev, it.ip, it.prefix)
-	return err
+	return it.close()
 }
 
 // List returns the managed interfaces, sorted by name, with ips[i] holding
@@ -197,52 +215,92 @@ func List() (names []string, ips []string, err error) {
 }
 
 // WriteTo injects the frame b into the interface whose address is ip. If no
-// interface has that exact address, the frame goes to the first interface
-// whose subnet contains ip (order is unspecified if subnets overlap).
+// interface has that exact address, the packet follows deterministic
+// longest-prefix matching across managed interface subnets.
 // b must be a complete IP packet no larger than the interface MTU.
 func WriteTo(ip string, b []byte) (n int, err error) {
+	if err := validatePacket(b); err != nil {
+		return 0, err
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return 0, fmt.Errorf("ifac: invalid destination %q: %w", ip, err)
+	}
+
 	cur := reg.Load()
-	it, ok := cur.byIP[ip]
+	it, ok := cur.byIP[addr.String()]
 	if !ok {
-		if a, perr := netip.ParseAddr(ip); perr == nil {
-			for _, cand := range cur.byIP {
-				if cand.prefix.Contains(a) {
-					it, ok = cand, true
-					break
-				}
+		for _, cand := range cur.routes {
+			if cand.prefix.Contains(addr) {
+				it, ok = cand, true
+				break
 			}
 		}
 	}
 	if !ok {
 		return 0, fmt.Errorf("ifac: no interface for %q", ip)
 	}
-	return it.tun.Write(b)
+	return it.write(b)
 }
 
-// ReadFrom blocks until a frame arrives on any managed interface, copies it
-// into b, and returns the address of the interface it arrived on along with
-// the frame length. If b is too small the frame is truncated to len(b) and
-// the error is io.ErrShortBuffer; size b at 65536 bytes (or the MTU) to
-// avoid truncation. Multiple goroutines may call ReadFrom concurrently;
-// each frame is delivered to exactly one caller.
-func ReadFrom(b []byte) (ip string, n int, err error) {
-	f := <-inbox
-	n = copy(b, (*f.buf)[:f.n])
-	pool.Put(f.buf)
-	if n < f.n {
-		return f.ip, n, io.ErrShortBuffer
+// ReadFrom blocks until a packet arrives on any managed interface or ctx is
+// canceled. It copies the packet into b and returns the address of the
+// interface it arrived on along with the packet length. If b is too small,
+// the packet is truncated to len(b) and the error is io.ErrShortBuffer; size b
+// at MaxFrameSize (or the MTU) to avoid truncation. Multiple goroutines may
+// call ReadFrom concurrently; each packet is delivered to exactly one caller.
+func ReadFrom(ctx context.Context, b []byte) (ip string, n int, err error) {
+	for {
+		var f frame
+		select {
+		case f = <-inbox:
+		case <-ctx.Done():
+			return "", 0, ctx.Err()
+		}
+
+		// Down removes the source before closing the device. Discard packets
+		// already queued by that device so a reused address cannot receive stale
+		// traffic from a previous interface generation.
+		if f.err != nil {
+			return f.source.ip, 0, f.err
+		}
+		current := reg.Load().byName[f.source.name]
+		if current != f.source {
+			releaseFrame(f)
+			continue
+		}
+
+		n = copy(b, (*f.buf)[:f.n])
+		releaseFrame(f)
+		if n < f.n {
+			return f.source.ip, n, io.ErrShortBuffer
+		}
+		return f.source.ip, n, nil
 	}
-	return f.ip, n, nil
 }
 
 // readLoop pumps frames from one TUN device into the shared inbox. It exits
-// when the device is closed (Destroy) or hits a read error.
+// when the device is closed (Down) or hits a read error.
 func (it *iface) readLoop() {
 	for {
 		bp := pool.Get().(*[]byte)
 		n, err := it.tun.Read(*bp)
 		if err != nil {
 			pool.Put(bp)
+			select {
+			case <-it.done:
+				return
+			default:
+			}
+
+			removed, cleanupErr := retireFailedInterface(it)
+			if removed {
+				readErr := fmt.Errorf("ifac: read %q (%s): %w", it.name, it.dev, err)
+				select {
+				case inbox <- frame{source: it, err: errors.Join(readErr, cleanupErr)}:
+				default:
+				}
+			}
 			return
 		}
 		if n == 0 {
@@ -250,10 +308,122 @@ func (it *iface) readLoop() {
 			continue
 		}
 		select {
-		case inbox <- frame{ip: it.ip, buf: bp, n: n}:
+		case inbox <- frame{source: it, buf: bp, n: n}:
 		case <-it.done:
 			pool.Put(bp)
 			return
 		}
 	}
+}
+
+func releaseFrame(f frame) {
+	if f.buf != nil {
+		pool.Put(f.buf)
+	}
+}
+
+func sortRoutes(routes []*iface) {
+	sort.Slice(routes, func(i, j int) bool {
+		if routes[i].prefix.Bits() != routes[j].prefix.Bits() {
+			return routes[i].prefix.Bits() > routes[j].prefix.Bits()
+		}
+		if routes[i].prefix.Addr() != routes[j].prefix.Addr() {
+			return routes[i].prefix.Addr().Less(routes[j].prefix.Addr())
+		}
+		return routes[i].name < routes[j].name
+	})
+}
+
+func removeRoute(routes []*iface, target *iface) []*iface {
+	for i, route := range routes {
+		if route == target {
+			return append(routes[:i:i], routes[i+1:]...)
+		}
+	}
+	return routes
+}
+
+func retireFailedInterface(it *iface) (bool, error) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	cur := reg.Load()
+	if cur.byName[it.name] != it {
+		return false, nil
+	}
+
+	next := cur.clone()
+	delete(next.byName, it.name)
+	delete(next.byIP, it.ip)
+	next.routes = removeRoute(next.routes, it)
+	reg.Store(next)
+
+	close(it.done)
+	return true, it.close()
+}
+
+func (it *iface) write(packet []byte) (int, error) {
+	it.ioMu.RLock()
+	defer it.ioMu.RUnlock()
+
+	if it.closed {
+		return 0, ErrClosed
+	}
+	return it.tun.Write(packet)
+}
+
+func (it *iface) close() error {
+	it.ioMu.Lock()
+	defer it.ioMu.Unlock()
+
+	if it.closed {
+		return nil
+	}
+	it.closed = true
+	return errors.Join(
+		teardown(it.dev, it.ip, it.prefix),
+		it.tun.Close(),
+	)
+}
+
+func validatePacket(packet []byte) error {
+	if len(packet) == 0 {
+		return errors.New("ifac: packet is empty")
+	}
+	if len(packet) > MaxFrameSize {
+		return fmt.Errorf("ifac: packet is %d bytes; maximum is %d", len(packet), MaxFrameSize)
+	}
+
+	switch packet[0] >> 4 {
+	case 4:
+		if len(packet) < 20 {
+			return fmt.Errorf("ifac: truncated IPv4 packet: %d bytes", len(packet))
+		}
+		headerLen := int(packet[0]&0x0f) * 4
+		if headerLen < 20 || headerLen > len(packet) {
+			return fmt.Errorf("ifac: invalid IPv4 header length: %d", headerLen)
+		}
+		totalLen := int(packet[2])<<8 | int(packet[3])
+		if totalLen != len(packet) {
+			return fmt.Errorf("ifac: IPv4 total length is %d; packet has %d bytes", totalLen, len(packet))
+		}
+	case 6:
+		if len(packet) < 40 {
+			return fmt.Errorf("ifac: truncated IPv6 packet: %d bytes", len(packet))
+		}
+		totalLen := 40 + (int(packet[4]) << 8) + int(packet[5])
+		if totalLen != len(packet) {
+			return fmt.Errorf("ifac: IPv6 payload length describes %d bytes; packet has %d", totalLen, len(packet))
+		}
+	default:
+		return fmt.Errorf("ifac: unsupported IP version %d", packet[0]>>4)
+	}
+	return nil
+}
+
+func wrapCleanupError(name string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("ifac: clean up %q after failed create: %w", name, err)
 }

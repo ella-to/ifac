@@ -2,6 +2,14 @@ module ella.to/ifac
 
 go 1.25.6
 
-require github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
+toolchain go1.25.12
 
-require golang.org/x/sys v0.46.0 // indirect
+require github.com/Doridian/water v1.6.2
+
+require (
+	github.com/Doridian/gopacket v1.3.4 // indirect
+	golang.org/x/net v0.38.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
+	golang.zx2c4.com/wireguard v0.0.0-20231211153847-12269c276173 // indirect
+)

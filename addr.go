@@ -5,15 +5,22 @@ import (
 	"net/netip"
 )
 
+func validatePrefix(prefix netip.Prefix) error {
+	if !prefix.Addr().Is4() {
+		return fmt.Errorf("ifac: subnet %s: only IPv4 subnets are supported", prefix)
+	}
+	if prefix.Bits() > 30 {
+		return fmt.Errorf("ifac: subnet %s has no usable host addresses (need /30 or wider)", prefix)
+	}
+	return nil
+}
+
 // pickIP returns the first usable IPv4 host address in prefix for which
 // taken reports false. The network and broadcast addresses are never
 // returned, so prefixes must be /30 or wider.
 func pickIP(prefix netip.Prefix, taken func(netip.Addr) bool) (netip.Addr, error) {
-	if !prefix.Addr().Is4() {
-		return netip.Addr{}, fmt.Errorf("ifac: subnet %s: only IPv4 subnets are supported", prefix)
-	}
-	if prefix.Bits() > 30 {
-		return netip.Addr{}, fmt.Errorf("ifac: subnet %s has no usable host addresses (need /30 or wider)", prefix)
+	if err := validatePrefix(prefix); err != nil {
+		return netip.Addr{}, err
 	}
 	bcast := lastAddr(prefix)
 	for a := prefix.Masked().Addr().Next(); a.Less(bcast); a = a.Next() {

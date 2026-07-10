@@ -6,7 +6,7 @@ import (
 	"net/netip"
 	"regexp"
 
-	"github.com/songgao/water"
+	"github.com/Doridian/water"
 )
 
 var utunName = regexp.MustCompile(`^utun[0-9]+$`)
@@ -36,8 +36,7 @@ func configure(dev, ip string, prefix netip.Prefix) error {
 	return run("/sbin/route", "-q", "-n", "add", "-inet", prefix.Masked().String(), "-interface", dev)
 }
 
-// teardown is best-effort: the utun device vanishes when its fd closes, but
-// the subnet route can linger briefly, so remove it explicitly.
-func teardown(dev, _ string, prefix netip.Prefix) {
-	_ = run("/sbin/route", "-q", "-n", "delete", "-inet", prefix.Masked().String(), "-interface", dev)
+// Remove the explicit subnet route before the utun descriptor is closed.
+func teardown(dev, _ string, prefix netip.Prefix) error {
+	return run("/sbin/route", "-q", "-n", "delete", "-inet", prefix.Masked().String(), "-interface", dev)
 }

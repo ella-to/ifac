@@ -1,6 +1,7 @@
 package ifac
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/netip"
@@ -116,15 +117,93 @@ func TestLastAddr(t *testing.T) {
 	}
 }
 
-func TestDestroyUnknown(t *testing.T) {
-	if err := Destroy("no-such-interface"); err == nil {
-		t.Fatal("Destroy of unknown interface should error")
+func TestDownUnknown(t *testing.T) {
+	if err := Down("no-such-interface"); err == nil {
+		t.Fatal("Down of unknown interface should error")
 	}
 }
 
 func TestWriteToUnknown(t *testing.T) {
-	if _, err := WriteTo("203.0.113.1", []byte{0x45}); err == nil {
+	packet := make([]byte, 20)
+	packet[0] = 0x45
+	packet[3] = byte(len(packet))
+	if _, err := WriteTo("203.0.113.1", packet); err == nil {
 		t.Fatal("WriteTo with no matching interface should error")
+	}
+}
+
+func TestClosedInterfaceRejectsWrites(t *testing.T) {
+	it := &iface{closed: true}
+	if _, err := it.write(nil); !errors.Is(err, ErrClosed) {
+		t.Fatalf("write() error = %v, want ErrClosed", err)
+	}
+	if err := it.close(); err != nil {
+		t.Fatalf("second close() error = %v, want nil", err)
+	}
+}
+
+func TestValidatePacket(t *testing.T) {
+	ipv4 := make([]byte, 20)
+	ipv4[0] = 0x45
+	ipv4[3] = byte(len(ipv4))
+
+	ipv6 := make([]byte, 40)
+	ipv6[0] = 0x60
+
+	tests := []struct {
+		name   string
+		packet []byte
+		errs   bool
+	}{
+		{name: "IPv4", packet: ipv4},
+		{name: "IPv6", packet: ipv6},
+		{name: "empty", errs: true},
+		{name: "unknown version", packet: []byte{0x70}, errs: true},
+		{name: "truncated IPv4", packet: []byte{0x45}, errs: true},
+		{name: "bad IPv4 header length", packet: append([]byte{0x44, 0, 0, 20}, make([]byte, 16)...), errs: true},
+		{name: "wrong IPv4 total length", packet: append([]byte{0x45, 0, 0, 21}, make([]byte, 16)...), errs: true},
+		{name: "truncated IPv6", packet: []byte{0x60}, errs: true},
+		{name: "wrong IPv6 payload length", packet: append([]byte{0x60, 0, 0, 0, 0, 1}, make([]byte, 34)...), errs: true},
+		{name: "too large", packet: append([]byte{0x60}, make([]byte, MaxFrameSize)...), errs: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validatePacket(tt.packet)
+			if (err != nil) != tt.errs {
+				t.Fatalf("validatePacket() error = %v, want error %t", err, tt.errs)
+			}
+		})
+	}
+}
+
+func TestSortRoutesUsesLongestPrefixFirst(t *testing.T) {
+	routes := []*iface{
+		{name: "wide", prefix: netip.MustParsePrefix("10.0.0.0/8")},
+		{name: "narrow-z", prefix: netip.MustParsePrefix("10.1.2.0/24")},
+		{name: "narrow-a", prefix: netip.MustParsePrefix("10.1.2.0/24")},
+		{name: "middle", prefix: netip.MustParsePrefix("10.1.0.0/16")},
+	}
+	routes[1].name = "z"
+	routes[2].name = "a"
+
+	sortRoutes(routes)
+
+	got := []string{routes[0].name, routes[1].name, routes[2].name, routes[3].name}
+	want := []string{"a", "z", "middle", "wide"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sortRoutes() = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestReadFromCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, _, err := ReadFrom(ctx, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadFrom() error = %v, want context.Canceled", err)
 	}
 }
 
@@ -143,14 +222,14 @@ func TestIntegration(t *testing.T) {
 		name = "ifac-test0"
 	}
 
-	ip, err := Create(name, "10.199.0.0/24", "")
+	ip, err := Up(name, "10.199.0.0/24", "")
 	if err != nil {
-		t.Fatalf("Create: %v", err)
+		t.Fatalf("Up: %v", err)
 	}
-	defer Destroy(name)
+	defer Down(name)
 
 	if ip != "10.199.0.1" {
-		t.Errorf("Create assigned %s, want 10.199.0.1", ip)
+		t.Errorf("Up assigned %s, want 10.199.0.1", ip)
 	}
 
 	names, ips, err := List()
@@ -180,9 +259,9 @@ func TestIntegration(t *testing.T) {
 	deadline := time.After(10 * time.Second)
 	got := make(chan struct{})
 	go func() {
-		buf := make([]byte, maxFrameSize)
+		buf := make([]byte, MaxFrameSize)
 		for {
-			src, n, err := ReadFrom(buf)
+			src, n, err := ReadFrom(context.Background(), buf)
 			if err != nil && !errors.Is(err, io.ErrShortBuffer) {
 				t.Errorf("ReadFrom: %v", err)
 				return
@@ -205,10 +284,10 @@ func TestIntegration(t *testing.T) {
 		t.Fatal("timed out waiting for a frame from the TUN device")
 	}
 
-	if err := Destroy(name); err != nil {
-		t.Fatalf("Destroy: %v", err)
+	if err := Down(name); err != nil {
+		t.Fatalf("Down: %v", err)
 	}
-	if err := Destroy(name); err == nil {
-		t.Fatal("second Destroy should error")
+	if err := Down(name); err == nil {
+		t.Fatal("second Down should error")
 	}
 }

@@ -8,7 +8,7 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/songgao/water"
+	"github.com/Doridian/water"
 )
 
 // ipBin resolves iproute2's ip tool via PATH, falling back to well-known
@@ -46,7 +46,7 @@ func configure(dev, ip string, prefix netip.Prefix) error {
 	return run(bin, "link", "set", "dev", dev, "up")
 }
 
-// teardown is best-effort: a non-persistent TUN vanishes when its fd closes.
-func teardown(dev, _ string, _ netip.Prefix) {
-	_ = run(ipBin(), "link", "delete", dev)
+// A non-persistent Linux TUN vanishes when its file descriptor is closed.
+func teardown(_, _ string, _ netip.Prefix) error {
+	return nil
 }
