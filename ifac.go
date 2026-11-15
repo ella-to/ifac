@@ -38,6 +38,10 @@ const (
 	inboxSize = 1024
 )
 
+// teardownDevice is the platform teardown; tests replace it to avoid
+// running system commands against fake devices.
+var teardownDevice = teardown
+
 // ErrClosed is returned when an operation loses a race with interface
 // teardown after it has already selected that interface.
 var ErrClosed = errors.New("ifac: interface is closed")
@@ -517,7 +521,7 @@ func (it *iface) close() error {
 		return nil
 	}
 	return errors.Join(
-		teardown(it.dev, it.ip, it.prefix),
+		teardownDevice(it.dev, it.ip, it.prefix),
 		it.tun.Close(),
 	)
 }

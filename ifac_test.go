@@ -3,7 +3,7 @@ package ifac
 import (
 	"context"
 	"errors"
-	"io"
+	"fmt"
 	"net/netip"
 	"os"
 	"runtime"
@@ -299,32 +299,35 @@ func TestIntegration(t *testing.T) {
 		run(bin, "-c", "2", "-W", "1", "10.199.0.2")
 	}()
 
-	deadline := time.After(10 * time.Second)
-	got := make(chan struct{})
+	// The reader reports back over a channel rather than calling t from its
+	// own goroutine, and its context ends with the test so it cannot outlive
+	// it blocked in ReadFrom.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
 	go func() {
 		buf := make([]byte, MaxFrameSize)
 		for {
-			src, n, err := ReadFrom(context.Background(), buf)
-			if err != nil && !errors.Is(err, io.ErrShortBuffer) {
-				t.Errorf("ReadFrom: %v", err)
+			src, n, err := ReadFrom(ctx, buf)
+			if err != nil {
+				result <- fmt.Errorf("ReadFrom: %w", err)
 				return
 			}
 			if src == ip && n > 0 {
 				// Loop the frame straight back through WriteTo to
 				// exercise the write path with a real packet.
-				if _, werr := WriteTo(ip, buf[:n]); werr != nil {
-					t.Errorf("WriteTo: %v", werr)
+				if _, err := WriteTo(ip, buf[:n]); err != nil {
+					result <- fmt.Errorf("WriteTo: %w", err)
+					return
 				}
-				close(got)
+				result <- nil
 				return
 			}
 		}
 	}()
 
-	select {
-	case <-got:
-	case <-deadline:
-		t.Fatal("timed out waiting for a frame from the TUN device")
+	if err := <-result; err != nil {
+		t.Fatalf("waiting for a frame from the TUN device: %v", err)
 	}
 
 	if err := Down(name); err != nil {
