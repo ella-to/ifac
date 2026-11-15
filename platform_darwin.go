@@ -70,6 +70,10 @@ func (t *utun) write(packet []byte) (int, error) {
 
 func (t *utun) Close() error { return t.f.Close() }
 
+// validateName accepts any name: names other than utunN are only logical
+// handles on macOS.
+func validateName(string) error { return nil }
+
 // createTUN opens a utun device. The macOS kernel only accepts utunN device
 // names: a name of that form is requested verbatim, anything else lets the
 // kernel assign a device while the caller's name remains the logical handle.

@@ -56,6 +56,9 @@ func (w *wintunDevice) write(packet []byte) (int, error) {
 
 func (w *wintunDevice) Close() error { return w.dev.Close() }
 
+// validateName accepts any name; Windows adapter names are free-form.
+func validateName(string) error { return nil }
+
 // createTUN creates a native layer-3 Wintun adapter. Unlike the legacy
 // TAP-Windows emulation path, this does not require a preinstalled tap0901
 // adapter and does not synthesize ARP for a layer-3 device.

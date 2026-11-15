@@ -5,12 +5,34 @@ import (
 	"net/netip"
 )
 
+// minPrefixBits is the widest subnet Up accepts. Anything wider would claim a
+// large slice of the address space and override the host's own routes.
+const minPrefixBits = 8
+
+// reservedPrefixes cannot be assigned to an interface without breaking host
+// networking (or are not unicast at all).
+var reservedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),      // "this network"
+	netip.MustParsePrefix("127.0.0.0/8"),    // loopback
+	netip.MustParsePrefix("169.254.0.0/16"), // link-local
+	netip.MustParsePrefix("224.0.0.0/4"),    // multicast
+	netip.MustParsePrefix("240.0.0.0/4"),    // reserved, incl. limited broadcast
+}
+
 func validatePrefix(prefix netip.Prefix) error {
 	if !prefix.Addr().Is4() {
 		return fmt.Errorf("ifac: subnet %s: only IPv4 subnets are supported", prefix)
 	}
 	if prefix.Bits() > 30 {
 		return fmt.Errorf("ifac: subnet %s has no usable host addresses (need /30 or wider)", prefix)
+	}
+	if prefix.Bits() < minPrefixBits {
+		return fmt.Errorf("ifac: subnet %s is too wide (need /%d or narrower)", prefix, minPrefixBits)
+	}
+	for _, r := range reservedPrefixes {
+		if prefix.Overlaps(r) {
+			return fmt.Errorf("ifac: subnet %s overlaps reserved range %s", prefix, r)
+		}
 	}
 	return nil
 }

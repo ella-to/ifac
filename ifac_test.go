@@ -65,6 +65,48 @@ func TestPickIPSkipsBroadcast(t *testing.T) {
 	}
 }
 
+func TestValidatePrefix(t *testing.T) {
+	tests := []struct {
+		subnet string
+		errs   bool
+	}{
+		{subnet: "10.0.0.0/8"},
+		{subnet: "10.42.0.0/24"},
+		{subnet: "192.168.1.0/30"},
+		{subnet: "0.0.0.0/0", errs: true},
+		{subnet: "192.0.0.0/3", errs: true}, // wider than /8
+		{subnet: "127.0.0.0/8", errs: true},
+		{subnet: "127.1.0.0/16", errs: true},
+		{subnet: "169.254.10.0/24", errs: true},
+		{subnet: "224.0.0.0/24", errs: true},
+		{subnet: "255.255.255.0/24", errs: true},
+		{subnet: "0.1.0.0/16", errs: true},
+		{subnet: "192.168.1.0/31", errs: true},
+		{subnet: "fd00::/64", errs: true},
+	}
+	for _, tt := range tests {
+		err := validatePrefix(netip.MustParsePrefix(tt.subnet))
+		if (err != nil) != tt.errs {
+			t.Errorf("validatePrefix(%s) error = %v, want error %t", tt.subnet, err, tt.errs)
+		}
+	}
+}
+
+func TestCheckLinuxIfName(t *testing.T) {
+	valid := []string{"tun0", "ifac-test0", "a", "exactly15chars_"}
+	invalid := []string{"sixteen-chars-xx", ".", "..", "a/b", "tun%d", "eth0:1", "has space", "tab\tname", "nul\x00"}
+	for _, n := range valid {
+		if err := checkLinuxIfName(n); err != nil {
+			t.Errorf("checkLinuxIfName(%q) = %v, want nil", n, err)
+		}
+	}
+	for _, n := range invalid {
+		if err := checkLinuxIfName(n); err == nil {
+			t.Errorf("checkLinuxIfName(%q) = nil, want error", n)
+		}
+	}
+}
+
 func TestCheckIP(t *testing.T) {
 	tests := []struct {
 		ip     string

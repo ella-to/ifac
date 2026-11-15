@@ -57,7 +57,12 @@ type frame struct {
 	source *iface
 	buf    *[]byte
 	n      int
-	err    error
+}
+
+// readFailure reports that an interface's device failed and was retired.
+type readFailure struct {
+	ip  string
+	err error
 }
 
 type iface struct {
@@ -93,10 +98,29 @@ func (r *registry) clone() *registry {
 	return next
 }
 
+// reservation holds the address and subnet of an interface whose OS-level
+// setup or teardown is running outside mu.
+type reservation struct {
+	addr   netip.Addr
+	prefix netip.Prefix
+}
+
 var (
-	mu    sync.Mutex // serializes Up/Down (registry mutations)
-	reg   atomic.Pointer[registry]
+	mu  sync.Mutex // guards registry mutations and pending
+	reg atomic.Pointer[registry]
+
+	// pending reserves names, addresses and subnets for Up and Down calls
+	// that are configuring or tearing down a device without holding mu.
+	pending = map[string]reservation{}
+
 	inbox = make(chan frame, inboxSize)
+
+	// Read failures bypass the inbox so they are never dropped when it is
+	// full. The queue holds at most one entry per retired interface;
+	// failReady is signaled whenever it is non-empty.
+	failMu    sync.Mutex
+	failures  []readFailure
+	failReady = make(chan struct{}, 1)
 )
 
 func init() {
@@ -119,6 +143,9 @@ func Up(name string, subnet string, ip string) (string, error) {
 	if name == "" {
 		return "", errors.New("ifac: name must not be empty")
 	}
+	if err := validateName(name); err != nil {
+		return "", err
+	}
 	prefix, err := netip.ParsePrefix(subnet)
 	if err != nil {
 		return "", fmt.Errorf("ifac: invalid subnet %q: %w", subnet, err)
@@ -128,36 +155,26 @@ func Up(name string, subnet string, ip string) (string, error) {
 	}
 	prefix = prefix.Masked()
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	cur := reg.Load()
-	if _, ok := cur.byName[name]; ok {
-		return "", fmt.Errorf("ifac: interface %q already exists", name)
-	}
-
-	taken := func(a netip.Addr) bool {
-		_, used := cur.byIP[a]
-		return used
-	}
-
-	var addr netip.Addr
-	if ip == "" {
-		addr, err = pickIP(prefix, taken)
-	} else {
-		addr, err = checkIP(ip, prefix, taken)
-	}
+	addr, err := reserve(name, prefix, ip)
 	if err != nil {
 		return "", err
 	}
 	ip = addr.String()
 
+	// Device creation and configuration run outside mu (they shell out and
+	// can take seconds); the reservation keeps name, address and subnet ours.
 	tun, dev, err := createTUN(name)
 	if err != nil {
+		release(name)
 		return "", fmt.Errorf("ifac: create %q: %w", name, err)
 	}
 	if err := configure(dev, ip, prefix); err != nil {
-		cleanupErr := errors.Join(teardown(dev, ip, prefix), tun.Close())
+		// Do not run teardown here: configure may have failed before adding
+		// anything, and on macOS deleting the subnet route could remove a
+		// route that belongs to someone else. Whatever configure did add
+		// (address, link state, route) goes away with the device.
+		cleanupErr := tun.Close()
+		release(name)
 		return "", errors.Join(
 			fmt.Errorf("ifac: configure %q (%s): %w", name, dev, err),
 			wrapCleanupError(name, cleanupErr),
@@ -174,37 +191,94 @@ func Up(name string, subnet string, ip string) (string, error) {
 		done:   make(chan struct{}),
 	}
 
-	next := cur.clone()
+	mu.Lock()
+	delete(pending, name)
+	next := reg.Load().clone()
 	next.byName[name] = it
 	next.byIP[addr] = it
 	next.routes = append(next.routes, it)
 	sortRoutes(next.routes)
 	reg.Store(next)
+	mu.Unlock()
 
 	go it.readLoop()
 	return ip, nil
+}
+
+// reserve validates name, subnet and address against both managed
+// interfaces and in-flight Up/Down calls, then records a reservation.
+func reserve(name string, prefix netip.Prefix, ip string) (netip.Addr, error) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	cur := reg.Load()
+	if _, ok := cur.byName[name]; ok {
+		return netip.Addr{}, fmt.Errorf("ifac: interface %q already exists", name)
+	}
+	if _, ok := pending[name]; ok {
+		return netip.Addr{}, fmt.Errorf("ifac: interface %q is being brought up or torn down", name)
+	}
+	// Two interfaces on one subnet would compete for the same route (on
+	// macOS the second route add fails outright). Nested subnets are fine and
+	// are resolved by longest-prefix match.
+	for _, r := range cur.routes {
+		if r.prefix == prefix {
+			return netip.Addr{}, fmt.Errorf("ifac: subnet %s is already used by interface %q", prefix, r.name)
+		}
+	}
+	for n, r := range pending {
+		if r.prefix == prefix {
+			return netip.Addr{}, fmt.Errorf("ifac: subnet %s is already used by interface %q", prefix, n)
+		}
+	}
+
+	taken := func(a netip.Addr) bool {
+		if _, used := cur.byIP[a]; used {
+			return true
+		}
+		for _, r := range pending {
+			if r.addr == a {
+				return true
+			}
+		}
+		return false
+	}
+
+	var addr netip.Addr
+	var err error
+	if ip == "" {
+		addr, err = pickIP(prefix, taken)
+	} else {
+		addr, err = checkIP(ip, prefix, taken)
+	}
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	pending[name] = reservation{addr: addr, prefix: prefix}
+	return addr, nil
+}
+
+// release drops the reservation for name.
+func release(name string) {
+	mu.Lock()
+	delete(pending, name)
+	mu.Unlock()
 }
 
 // Down tears down the interface previously brought up under name. Packets
 // queued by that interface are discarded.
 func Down(name string) error {
 	mu.Lock()
-	defer mu.Unlock()
+	it, ok := reg.Load().byName[name]
+	if ok {
+		unregisterLocked(it)
+	}
+	mu.Unlock()
 
-	cur := reg.Load()
-	it, ok := cur.byName[name]
 	if !ok {
 		return fmt.Errorf("ifac: interface %q not found", name)
 	}
-
-	next := cur.clone()
-	delete(next.byName, name)
-	delete(next.byIP, it.addr)
-	next.routes = removeRoute(next.routes, it)
-	reg.Store(next)
-
-	close(it.done)
-	return it.close()
+	return retire(it)
 }
 
 // List returns the managed interfaces, sorted by name, with ips[i] holding
@@ -264,13 +338,15 @@ func ReadFrom(ctx context.Context, b []byte) (ip string, n int, err error) {
 		var f frame
 		select {
 		case f = <-inbox:
+		case <-failReady:
+			if rf, ok := popFailure(); ok {
+				return rf.ip, 0, rf.err
+			}
+			continue
 		case <-ctx.Done():
 			return "", 0, ctx.Err()
 		}
 
-		if f.err != nil {
-			return f.source.ip, 0, f.err
-		}
 		// Discard packets already queued by an interface that has since been
 		// torn down, so a reused address cannot receive stale traffic from a
 		// previous interface generation. Up cannot reuse the address until
@@ -310,10 +386,7 @@ func (it *iface) readLoop() {
 			removed, cleanupErr := retireFailedInterface(it)
 			if removed {
 				readErr := fmt.Errorf("ifac: read %q (%s): %w", it.name, it.dev, err)
-				select {
-				case inbox <- frame{source: it, err: errors.Join(readErr, cleanupErr)}:
-				default:
-				}
+				pushFailure(readFailure{ip: it.ip, err: errors.Join(readErr, cleanupErr)})
 			}
 			return
 		}
@@ -328,6 +401,35 @@ func (it *iface) readLoop() {
 			putBuffer(bp)
 			return
 		}
+	}
+}
+
+func pushFailure(rf readFailure) {
+	failMu.Lock()
+	failures = append(failures, rf)
+	failMu.Unlock()
+	signalFailure()
+}
+
+func popFailure() (readFailure, bool) {
+	failMu.Lock()
+	defer failMu.Unlock()
+	if len(failures) == 0 {
+		return readFailure{}, false
+	}
+	rf := failures[0]
+	failures[0] = readFailure{}
+	failures = failures[1:]
+	if len(failures) > 0 {
+		signalFailure() // wake another ReadFrom for the next one
+	}
+	return rf, true
+}
+
+func signalFailure() {
+	select {
+	case failReady <- struct{}{}:
+	default: // a wake-up is already pending
 	}
 }
 
@@ -358,23 +460,41 @@ func removeRoute(routes []*iface, target *iface) []*iface {
 	return routes
 }
 
+// retireFailedInterface removes an interface whose device failed, unless
+// Down already removed it.
 func retireFailedInterface(it *iface) (bool, error) {
 	mu.Lock()
-	defer mu.Unlock()
+	ok := reg.Load().byName[it.name] == it
+	if ok {
+		unregisterLocked(it)
+	}
+	mu.Unlock()
 
-	cur := reg.Load()
-	if cur.byName[it.name] != it {
+	if !ok {
 		return false, nil
 	}
+	return true, retire(it)
+}
 
-	next := cur.clone()
+// unregisterLocked removes it from the registry and reserves its name,
+// address and subnet until retire finishes, so a concurrent Up cannot claim
+// them while the old device still exists. mu must be held.
+func unregisterLocked(it *iface) {
+	next := reg.Load().clone()
 	delete(next.byName, it.name)
 	delete(next.byIP, it.addr)
 	next.routes = removeRoute(next.routes, it)
 	reg.Store(next)
+	pending[it.name] = reservation{addr: it.addr, prefix: it.prefix}
+}
 
+// retire stops the reader, tears the device down outside mu, then releases
+// the reservation taken by unregisterLocked.
+func retire(it *iface) error {
 	close(it.done)
-	return true, it.close()
+	err := it.close()
+	release(it.name)
+	return err
 }
 
 // write needs no lock: every device tolerates Close racing with write, and

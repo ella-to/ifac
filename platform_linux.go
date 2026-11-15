@@ -45,6 +45,9 @@ func (t *tunFile) write(packet []byte) (int, error) { return t.f.Write(packet) }
 
 func (t *tunFile) Close() error { return t.f.Close() }
 
+// validateName rejects names the kernel would truncate or reinterpret.
+func validateName(name string) error { return checkLinuxIfName(name) }
+
 // createTUN opens a non-persistent TUN device named name. The descriptor is
 // closed on every error path, so a failed Up never leaks it.
 func createTUN(name string) (device, string, error) {
