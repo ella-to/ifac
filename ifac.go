@@ -24,8 +24,6 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-
-	"github.com/Doridian/water"
 )
 
 const (
@@ -44,6 +42,17 @@ const (
 // teardown after it has already selected that interface.
 var ErrClosed = errors.New("ifac: interface is closed")
 
+// device is a platform TUN handle. Only the interface's reader goroutine
+// calls read; write may be called concurrently, and Close must be safe while
+// read and write are in progress.
+type device interface {
+	// read blocks until a packet arrives, reads it into buf, and reports
+	// where in buf the packet starts and how long it is.
+	read(buf []byte) (off, n int, err error)
+	write(packet []byte) (int, error)
+	Close() error
+}
+
 type frame struct {
 	source *iface
 	buf    *[]byte
@@ -54,26 +63,29 @@ type frame struct {
 type iface struct {
 	name   string // logical name given to Up
 	dev    string // actual OS device name (may differ on macOS)
-	ip     string
+	ip     string // addr.String(), precomputed for ReadFrom
+	addr   netip.Addr
 	prefix netip.Prefix
-	tun    *water.Interface
+	tun    device
 	done   chan struct{}
-	ioMu   sync.RWMutex
-	closed bool
+
+	// closed is set once, before the device is torn down. Writers and
+	// ReadFrom check it instead of taking a lock or consulting the registry.
+	closed atomic.Bool
 }
 
 // registry is immutable after construction; mutations build a new copy and
 // swap it in atomically so readers never take a lock.
 type registry struct {
 	byName map[string]*iface
-	byIP   map[string]*iface
+	byIP   map[netip.Addr]*iface
 	routes []*iface
 }
 
 func (r *registry) clone() *registry {
 	next := &registry{
 		byName: make(map[string]*iface, len(r.byName)+1),
-		byIP:   make(map[string]*iface, len(r.byIP)+1),
+		byIP:   make(map[netip.Addr]*iface, len(r.byIP)+1),
 		routes: append([]*iface(nil), r.routes...),
 	}
 	maps.Copy(next.byName, r.byName)
@@ -85,14 +97,10 @@ var (
 	mu    sync.Mutex // serializes Up/Down (registry mutations)
 	reg   atomic.Pointer[registry]
 	inbox = make(chan frame, inboxSize)
-	pool  = sync.Pool{New: func() any {
-		b := make([]byte, MaxFrameSize)
-		return &b
-	}}
 )
 
 func init() {
-	reg.Store(&registry{byName: map[string]*iface{}, byIP: map[string]*iface{}})
+	reg.Store(&registry{byName: map[string]*iface{}, byIP: map[netip.Addr]*iface{}})
 }
 
 // Up brings up a TUN interface under the given logical name and returns
@@ -129,7 +137,7 @@ func Up(name string, subnet string, ip string) (string, error) {
 	}
 
 	taken := func(a netip.Addr) bool {
-		_, used := cur.byIP[a.String()]
+		_, used := cur.byIP[a]
 		return used
 	}
 
@@ -144,7 +152,7 @@ func Up(name string, subnet string, ip string) (string, error) {
 	}
 	ip = addr.String()
 
-	tun, dev, err := createTUN(name, ip, prefix)
+	tun, dev, err := createTUN(name)
 	if err != nil {
 		return "", fmt.Errorf("ifac: create %q: %w", name, err)
 	}
@@ -160,6 +168,7 @@ func Up(name string, subnet string, ip string) (string, error) {
 		name:   name,
 		dev:    dev,
 		ip:     ip,
+		addr:   addr,
 		prefix: prefix,
 		tun:    tun,
 		done:   make(chan struct{}),
@@ -167,7 +176,7 @@ func Up(name string, subnet string, ip string) (string, error) {
 
 	next := cur.clone()
 	next.byName[name] = it
-	next.byIP[ip] = it
+	next.byIP[addr] = it
 	next.routes = append(next.routes, it)
 	sortRoutes(next.routes)
 	reg.Store(next)
@@ -190,7 +199,7 @@ func Down(name string) error {
 
 	next := cur.clone()
 	delete(next.byName, name)
-	delete(next.byIP, it.ip)
+	delete(next.byIP, it.addr)
 	next.routes = removeRoute(next.routes, it)
 	reg.Store(next)
 
@@ -226,9 +235,10 @@ func WriteTo(ip string, b []byte) (n int, err error) {
 	if err != nil {
 		return 0, fmt.Errorf("ifac: invalid destination %q: %w", ip, err)
 	}
+	addr = addr.Unmap() // treat ::ffff:a.b.c.d as a.b.c.d
 
 	cur := reg.Load()
-	it, ok := cur.byIP[addr.String()]
+	it, ok := cur.byIP[addr]
 	if !ok {
 		for _, cand := range cur.routes {
 			if cand.prefix.Contains(addr) {
@@ -258,14 +268,14 @@ func ReadFrom(ctx context.Context, b []byte) (ip string, n int, err error) {
 			return "", 0, ctx.Err()
 		}
 
-		// Down removes the source before closing the device. Discard packets
-		// already queued by that device so a reused address cannot receive stale
-		// traffic from a previous interface generation.
 		if f.err != nil {
 			return f.source.ip, 0, f.err
 		}
-		current := reg.Load().byName[f.source.name]
-		if current != f.source {
+		// Discard packets already queued by an interface that has since been
+		// torn down, so a reused address cannot receive stale traffic from a
+		// previous interface generation. Up cannot reuse the address until
+		// teardown has marked the interface closed.
+		if f.source.closed.Load() {
 			releaseFrame(f)
 			continue
 		}
@@ -281,12 +291,16 @@ func ReadFrom(ctx context.Context, b []byte) (ip string, n int, err error) {
 
 // readLoop pumps frames from one TUN device into the shared inbox. It exits
 // when the device is closed (Down) or hits a read error.
+//
+// Each read lands in a per-interface scratch buffer large enough for any
+// packet, so oversized packets are never truncated, and is then copied into
+// a pooled buffer sized to the packet. For typical packets that copy is far
+// cheaper than queueing a 64 KB buffer per frame.
 func (it *iface) readLoop() {
+	scratch := make([]byte, MaxFrameSize+readHeadroom)
 	for {
-		bp := pool.Get().(*[]byte)
-		n, err := it.tun.Read(*bp)
+		off, n, err := it.tun.read(scratch)
 		if err != nil {
-			pool.Put(bp)
 			select {
 			case <-it.done:
 				return
@@ -303,14 +317,15 @@ func (it *iface) readLoop() {
 			}
 			return
 		}
-		if n == 0 {
-			pool.Put(bp)
+		if n <= 0 {
 			continue
 		}
+		bp := getBuffer(n)
+		copy(*bp, scratch[off:off+n])
 		select {
 		case inbox <- frame{source: it, buf: bp, n: n}:
 		case <-it.done:
-			pool.Put(bp)
+			putBuffer(bp)
 			return
 		}
 	}
@@ -318,7 +333,7 @@ func (it *iface) readLoop() {
 
 func releaseFrame(f frame) {
 	if f.buf != nil {
-		pool.Put(f.buf)
+		putBuffer(f.buf)
 	}
 }
 
@@ -354,7 +369,7 @@ func retireFailedInterface(it *iface) (bool, error) {
 
 	next := cur.clone()
 	delete(next.byName, it.name)
-	delete(next.byIP, it.ip)
+	delete(next.byIP, it.addr)
 	next.routes = removeRoute(next.routes, it)
 	reg.Store(next)
 
@@ -362,24 +377,25 @@ func retireFailedInterface(it *iface) (bool, error) {
 	return true, it.close()
 }
 
+// write needs no lock: every device tolerates Close racing with write, and
+// an error caused by that race is reported as ErrClosed.
 func (it *iface) write(packet []byte) (int, error) {
-	it.ioMu.RLock()
-	defer it.ioMu.RUnlock()
-
-	if it.closed {
+	if it.closed.Load() {
 		return 0, ErrClosed
 	}
-	return it.tun.Write(packet)
+	n, err := it.tun.write(packet)
+	if err != nil && it.closed.Load() {
+		return n, ErrClosed
+	}
+	return n, err
 }
 
+// close marks the interface closed, so writers fail fast with ErrClosed while
+// the (possibly slow) platform teardown runs, then releases the device.
 func (it *iface) close() error {
-	it.ioMu.Lock()
-	defer it.ioMu.Unlock()
-
-	if it.closed {
+	if !it.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	it.closed = true
 	return errors.Join(
 		teardown(it.dev, it.ip, it.prefix),
 		it.tun.Close(),

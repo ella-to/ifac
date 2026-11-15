@@ -5,23 +5,76 @@ package ifac
 import (
 	"net/netip"
 	"strconv"
+	"sync"
 
-	"github.com/Doridian/water"
+	"golang.zx2c4.com/wireguard/tun"
 )
+
+// readHeadroom is the number of bytes the device prepends to each packet it
+// reads. Wintun delivers bare IP packets.
+const readHeadroom = 0
+
+// wintunMTU is the MTU the adapter is created with.
+const wintunMTU = 1500
+
+// wintunDevice adapts wireguard-go's vectored Wintun device to a
+// packet-at-a-time interface. The single-element slices are reused so the
+// per-packet path does not allocate. Wintun itself rejects I/O after Close
+// and waits for in-flight calls, so Close is safe alongside read and write.
+type wintunDevice struct {
+	dev tun.Device
+
+	// Only the interface's reader goroutine calls read.
+	rbufs [][]byte
+	sizes []int
+
+	wmu   sync.Mutex
+	wbufs [][]byte
+}
+
+func (w *wintunDevice) read(buf []byte) (int, int, error) {
+	w.rbufs[0] = buf
+	n, err := w.dev.Read(w.rbufs, w.sizes, 0)
+	w.rbufs[0] = nil
+	if err != nil || n == 0 {
+		return 0, 0, err
+	}
+	return 0, w.sizes[0], nil
+}
+
+func (w *wintunDevice) write(packet []byte) (int, error) {
+	w.wmu.Lock()
+	w.wbufs[0] = packet
+	_, err := w.dev.Write(w.wbufs, 0)
+	w.wbufs[0] = nil
+	w.wmu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+	return len(packet), nil
+}
+
+func (w *wintunDevice) Close() error { return w.dev.Close() }
 
 // createTUN creates a native layer-3 Wintun adapter. Unlike the legacy
 // TAP-Windows emulation path, this does not require a preinstalled tap0901
 // adapter and does not synthesize ARP for a layer-3 device.
-func createTUN(name, _ string, _ netip.Prefix) (*water.Interface, string, error) {
-	cfg := water.Config{DeviceType: water.TUN}
-	cfg.PlatformSpecificParams = water.PlatformSpecificParams{
-		InterfaceName: name,
-	}
-	tun, err := water.New(cfg)
+func createTUN(name string) (device, string, error) {
+	dev, err := tun.CreateTUN(name, wintunMTU)
 	if err != nil {
 		return nil, "", err
 	}
-	return tun, tun.Name(), nil
+	devName, err := dev.Name()
+	if err != nil {
+		dev.Close()
+		return nil, "", err
+	}
+	return &wintunDevice{
+		dev:   dev,
+		rbufs: make([][]byte, 1),
+		sizes: make([]int, 1),
+		wbufs: make([][]byte, 1),
+	}, devName, nil
 }
 
 // The PowerShell scripts read their inputs from environment variables:

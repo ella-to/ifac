@@ -133,7 +133,8 @@ func TestWriteToUnknown(t *testing.T) {
 }
 
 func TestClosedInterfaceRejectsWrites(t *testing.T) {
-	it := &iface{closed: true}
+	it := &iface{}
+	it.closed.Store(true)
 	if _, err := it.write(nil); !errors.Is(err, ErrClosed) {
 		t.Fatalf("write() error = %v, want ErrClosed", err)
 	}
