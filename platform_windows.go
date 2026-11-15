@@ -24,17 +24,24 @@ func createTUN(name, _ string, _ netip.Prefix) (*water.Interface, string, error)
 	return tun, tun.Name(), nil
 }
 
+// The PowerShell scripts read their inputs from environment variables:
+// with -Command, trailing arguments are appended to the script text rather
+// than bound to $args, and the environment also keeps adapter names with
+// spaces or quotes intact.
+
 func configure(dev, ip string, prefix netip.Prefix) error {
 	const script = `$ErrorActionPreference = 'Stop'
-New-NetIPAddress -InterfaceAlias $args[0] -AddressFamily IPv4 -IPAddress $args[1] -PrefixLength ([byte]$args[2]) -PolicyStore ActiveStore | Out-Null`
-	return run("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
-		"-Command", script, dev, ip, strconv.Itoa(prefix.Bits()))
+New-NetIPAddress -InterfaceAlias $env:IFAC_DEV -AddressFamily IPv4 -IPAddress $env:IFAC_IP -PrefixLength ([byte]$env:IFAC_BITS) -PolicyStore ActiveStore | Out-Null`
+	return powershell(script, "IFAC_DEV="+dev, "IFAC_IP="+ip, "IFAC_BITS="+strconv.Itoa(prefix.Bits()))
 }
 
 func teardown(dev, ip string, _ netip.Prefix) error {
 	const script = `$ErrorActionPreference = 'Stop'
-Get-NetIPAddress -InterfaceAlias $args[0] -AddressFamily IPv4 -IPAddress $args[1] -ErrorAction SilentlyContinue |
+Get-NetIPAddress -InterfaceAlias $env:IFAC_DEV -AddressFamily IPv4 -IPAddress $env:IFAC_IP -ErrorAction SilentlyContinue |
 	Remove-NetIPAddress -Confirm:$false`
-	return run("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
-		"-Command", script, dev, ip)
+	return powershell(script, "IFAC_DEV="+dev, "IFAC_IP="+ip)
+}
+
+func powershell(script string, env ...string) error {
+	return runEnv(env, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script)
 }
